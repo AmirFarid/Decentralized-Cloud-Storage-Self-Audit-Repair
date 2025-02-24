@@ -396,7 +396,7 @@ int main(void)
 
     // Data for initialization provided by local file at the filePath of fileName
     char fileName[512];
-    strcpy(fileName, "/home/jdafoe/Decentralized-Cloud-Storage-Self-Audit-Repair/App-Enclave/testFile");
+    strcpy(fileName, "/home/amoghad1/project/jsosh/Decentralized-Cloud-Storage-Self-Audit-Repair/App-Enclave/testFile");
     int numBlocks = 10;
 
     // Perform file initialization in SGX
