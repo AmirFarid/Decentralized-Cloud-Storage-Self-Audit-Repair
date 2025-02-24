@@ -6,17 +6,17 @@
 #include <string.h>
 #include <stdint.h>
 
-#ifdef USE_OPENSSL
+// #ifdef USE_OPENSSL
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
 #include <openssl/err.h>
-#else
+// #else
 
-#include <sha/sha.h>
+// #include <sha/sha.h>
 
-#endif
+// #endif
 
-#include <hmac/hmac.h>
+// #include <hmac/hmac.h>
 
 
 /** SHA-1 Block size */
