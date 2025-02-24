@@ -80,7 +80,7 @@ else
 endif
 
 App_C_Files := App/App.c App/ccom/ccom.c 
-App_Include_Paths := -IApp -I$(SGX_SDK)/include -IApp/ccom -IEnclave
+App_Include_Paths := -IApp -I$(SGX_SDK)/include -IApp/ccom -IEnclave -I/usr/local/include/jerasure
 
 App_C_Flags := -fPIC -Wno-attributes $(App_Include_Paths)
 
@@ -96,7 +96,7 @@ else
         App_C_Flags += -DNDEBUG -UEDEBUG -UDEBUG
 endif
 
-App_Link_Flags := -L$(SGX_LIBRARY_PATH) -l$(Urts_Library_Name) -lpthread 
+App_Link_Flags := -L$(SGX_LIBRARY_PATH) -l$(Urts_Library_Name) -lpthread -L/usr/local/lib -lJerasure -lgf_complete
 
 App_C_Objects := $(App_C_Files:.c=.o)
 
@@ -150,7 +150,7 @@ Enclave_Link_Flags := $(Enclave_Security_Link_Flags) \
 	-Wl,-pie,-eenclave_entry -Wl,--export-dynamic  \
 	-Wl,--defsym,__ImageBase=0 \
 	-Wl,--version-script=$(Enclave_Version_Script) \
-	-lrs -lfec
+	-lfec
 
  
 
