@@ -32,6 +32,8 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <math.h>
+#include <jerasure.h>
+
 
 // TODO: How should these be stored?
 uint8_t dh_sharedKey[ECC_PUB_KEY_SIZE];
@@ -173,6 +175,12 @@ int EncryptData(uint32_t* KEY,void* buffer, int dataLen)
     }
   return 0;
 }
+
+int encode_with_erasure_coding(uint8_t *data, int k, int n, uint8_t **encoded_chunks){
+
+	return 0;
+}
+
 
 // Uses repeated calls to ocall_printf, to print arbitrarily sized bignums
 void printBN(BIGNUM *bn, int size) 
