@@ -21,6 +21,8 @@
 #define NUM_ORIGINAL_SYMBOLS 2 // Erasure code parameters. Maybe should be part of File struct
 #define NUM_TOTAL_SYMBOLS 3
 
+#define Max_PEER 5
+
 #define SECRET_LENGTH ((PAGE_SIZE * 8) / 256) // One bit in secret message every 512 bits.
 #define PARITY_START 5000 // Start address for parity data.
 

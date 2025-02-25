@@ -25,6 +25,12 @@ typedef struct File {
 	uint8_t sortKey[KEY_SIZE]; // I never define this. I should randomly generate it in file_init.
 } File;
 
+typedef struct {
+    char ip[16];   // Store IPv4 address
+    int port;      // Port number
+	uint8_t cIndex // Chunk Number
+} IP;
+
 extern File files[MAX_FILES];
 
 extern PorSK porSK;

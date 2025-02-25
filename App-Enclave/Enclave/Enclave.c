@@ -32,13 +32,18 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <math.h>
+
+#include <stdlib.h>
 #include <jerasure.h>
+// #include "erasure_coding.h"
+#include <reed_sol.h>
 
 
 // TODO: How should these be stored?
 uint8_t dh_sharedKey[ECC_PUB_KEY_SIZE];
 PorSK porSK;
 File files[MAX_FILES];
+IP IPs [Max_PEER];
 
 #ifdef TEST_MODE
 
@@ -176,10 +181,6 @@ int EncryptData(uint32_t* KEY,void* buffer, int dataLen)
   return 0;
 }
 
-int encode_with_erasure_coding(uint8_t *data, int k, int n, uint8_t **encoded_chunks){
-
-	return 0;
-}
 
 
 // Uses repeated calls to ocall_printf, to print arbitrarily sized bignums
@@ -440,14 +441,62 @@ void code_data(int *symbolData, int blocksInGroup, int type)
 void ecall_generate_file_parity(int fileNum) 
 {
 
+
+	// Find a better place for it
+	IPEntry ip_list[Max_PEER] = {
+        {"192.168.1.1", 22},   
+        {"10.0.0.2", 80},      
+        {"172.16.0.5", 443},   
+        {"8.8.8.8", 53}        
+    };
+	// specify the needed peers
+	for (int i = 0; i < Max_PEER; i++)
+	{
+		IPs[i].ip = ip_list[i][0];
+		IPs[i].port = ip_list[i][1];
+
+	}
+	
+
+
+	// Define encoded_chunks outside of the if block
+    uint8_t **encoded_chunks = (uint8_t **)malloc(files[fileNum].n * sizeof(uint8_t *));
+    if (!encoded_chunks) {
+        ocall_print("Error: Memory allocation for encoded_chunks failed\n");
+        return;
+    }
+
+    // Call erasure coding function
+    int status = encode_with_erasure_coding(fileNum, encoded_chunks);
+    if (status != 0) {
+        ocall_print("Error: Erasure coding failed\n");
+        free(encoded_chunks);
+        return;
+    }
+
+    // Now, encoded_chunks is available for the rest of the function
+    uint8_t *inputFile = encoded_chunks[0]; // Treat the first chunk as input for the next steps
+
+
     // generating parity data, encrypting it and sending it to FTL.
 
+	// Compute the number of blocks in this chunk
+	int numBlocks = files[fileNum].numBlocks / files[fileNum].k;
+
+	// Compute the number of pages in this chunk
+	int numPages = numBlocks * PAGE_PER_BLOCK;
+
+	// Compute the number of groups within this chunk
+	int numGroups = files[fileNum].numGroups / files[fileNum].k;
+
+	// Compute numBits based on numPages
+	int numBits = (int)ceil(log2(numPages));
 
     // Generate groups array.
-    int numBlocks = files[fileNum].numBlocks;
-    int numPages = numBlocks * PAGE_PER_BLOCK;
-	int numGroups = files[fileNum].numGroups;
-    int numBits = (int)ceil(log2(numPages));
+    // int numBlocks = files[fileNum].numBlocks;
+    // int numPages = numBlocks * PAGE_PER_BLOCK;
+	// int numGroups = files[fileNum].numGroups;
+    // int numBits = (int)ceil(log2(numPages));
 
 	ocall_init_parity(numBits); /* 
 							     * This Does two things:
@@ -1659,3 +1708,71 @@ void ecall_audit_file(const char *fileName, int *ret)
 
 
 
+
+/**
+ * Applies (n, k) erasure coding inside an SGX enclave.
+ *
+ * @param fileNum - Index of the file in the `files` array.
+ * @param encoded_chunks - Pointer to an enclave-allocated array storing `n` encoded chunks.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int encode_with_erasure_coding(int fileNum, uint8_t **encoded_chunks) {
+    if (fileNum < 0 || fileNum >= MAX_FILES || !files[fileNum].inUse) {
+        ocall_print("Error: Invalid file index\n");
+        return -1;
+    }
+
+    // Retrieve file metadata
+    int k = files[fileNum].k;       // Data chunks
+    int n = files[fileNum].n;       // Total chunks (data + parity)
+    int numBlocks = files[fileNum].numBlocks;  // Total number of blocks
+
+    // Calculate correct chunk size
+    int chunk_size = (numBlocks * BLOCK_SIZE) / k;  // Divide actual data into k chunks
+
+    uint8_t *data_chunks[k];
+    uint8_t *parity_chunks[n - k];
+
+    // Allocate enclave memory for data and parity chunks
+    for (int i = 0; i < k; i++) {
+        data_chunks[i] = (uint8_t *)malloc(chunk_size);
+        if (!data_chunks[i]) {
+            ocall_print("Error: Memory allocation failed for data_chunks\n");
+            return -1;
+        }
+    }
+
+    for (int i = 0; i < (n - k); i++) {
+        parity_chunks[i] = (uint8_t *)malloc(chunk_size);
+        if (!parity_chunks[i]) {
+            ocall_print("Error: Memory allocation failed for parity_chunks\n");
+            return -1;
+        }
+        memset(parity_chunks[i], 0, chunk_size);  // Initialize parity data
+    }
+
+    // Generate Reed-Solomon coding matrix
+    int *matrix = reed_sol_vandermonde_coding_matrix(k, n, 8);
+    if (!matrix) {
+        ocall_print("Error: Failed to generate coding matrix\n");
+        return -1;
+    }
+
+    // Encode data using Jerasure
+    jerasure_matrix_encode(k, n, 8, matrix, (char **)data_chunks, (char **)parity_chunks, chunk_size);
+
+    // Store encoded chunks inside the enclave memory
+    for (int i = 0; i < k; i++) {
+        encoded_chunks[i] = data_chunks[i];
+    }
+    for (int i = 0; i < (n - k); i++) {
+        encoded_chunks[k + i] = parity_chunks[i];
+    }
+
+    // Free matrix memory
+    free(matrix);
+
+    ocall_print("Erasure coding completed successfully!\n");
+    return 0; // Success
+}

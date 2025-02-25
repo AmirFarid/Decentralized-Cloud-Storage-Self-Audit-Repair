@@ -17,7 +17,7 @@
 #include "Enclave_u.h"
 #include "ccom.h"
 #include <time.h>
-#include <jerasure.h>
+// #include <jerasure.h>
 
 #include <string.h>
 
