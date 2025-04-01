@@ -11,6 +11,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <string.h>
 
 #include "sgx_urts.h"
 #include "sharedTypes.h"
@@ -20,6 +23,8 @@
 // #include <jerasure.h>
 
 #include <string.h>
+#include <netinet/in.h>  // For network structures
+
 
 void ocall_send_parity(int startPage, uint8_t *parityData, size_t size)
 {
@@ -358,9 +363,147 @@ void app_file_init(sgx_enclave_id_t eid, const char *fileName,  int numBlocks)
                                          // Above, the gennerated data is directly retrurned, rather than written via an ocall, as is done here.
 }
 
+int ocall_establish_secure_connection(const char* ip_addr, uint16_t port) {
+    // Create socket
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        return -1;  // Socket creation failed
+    }
 
+    // Set up server address structure
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    
+    // Convert IP string to network address
+    if (inet_pton(AF_INET, ip_addr, &server_addr.sin_addr) <= 0) {
+        close(sockfd);
+        return -2;  // Invalid IP address
+    }
 
+    // Set socket options
+    int opt = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        close(sockfd);
+        return -3;  // Socket options failed
+    }
 
+    // Set timeout for connection
+    struct timeval timeout;
+    timeout.tv_sec = 5;  // 5 seconds timeout
+    timeout.tv_usec = 0;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        close(sockfd);
+        return -4;  // Timeout setting failed
+    }
+
+    // Connect to server
+    if (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        close(sockfd);
+        return -5;  // Connection failed
+    }
+
+    return sockfd;  // Return socket descriptor for future use
+}
+
+void ocall_close_connection(int sockfd) {
+    if (sockfd >= 0) {
+        close(sockfd);
+    }
+}
+
+int establish_server_connection(int client_fd) {
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");  // Connect to localhost
+    server_addr.sin_port = htons(8080);  // Default port
+
+    // Set socket options
+    int opt = 1;
+    if (setsockopt(client_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        close(client_fd);
+        return -1;
+    }
+
+    // Set timeout for connection
+    struct timeval timeout;
+    timeout.tv_sec = 5;  // 5 seconds timeout
+    timeout.tv_usec = 0;
+    if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        close(client_fd);
+        return -1;
+    }
+
+    // Connect to server
+    if (connect(client_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        close(client_fd);
+        return -1;
+    }
+
+    return 0;
+}
+
+int ocall_send_data(const uint8_t* data, size_t len) {
+    int client_fd = create_client_socket();
+    establish_server_connection(client_fd);
+    int result = write(client_fd, data, len);
+    close(client_fd);
+    return result;
+}
+
+int ocall_receive_data(uint8_t* data, size_t len) {
+    int client_fd = create_client_socket();
+    establish_server_connection(client_fd);
+    int result = read(client_fd, data, len);
+    close(client_fd);
+    return result;
+}
+
+int ocall_RS_recovery(uint8_t** blocks, int k, int n, int block_num) {
+    // Implement Reed-Solomon recovery
+    // This would typically involve using a Reed-Solomon library to recover the block
+    return 0;
+}
+
+int ocall_init_server_socket() {
+    struct sockaddr_in server_addr;
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        return -1;
+    }
+
+    int opt = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(8080);  // Default port
+
+    if (bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    if (listen(sockfd, 5) < 0) {
+        close(sockfd);
+        return -1;
+    }
+
+    return sockfd;
+}
+
+int ocall_accept_connection(int server_socket) {
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
+    return client_socket;
+}
 
 int main(void) 
 {

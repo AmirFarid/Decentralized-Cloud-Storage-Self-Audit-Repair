@@ -1,3 +1,8 @@
+// for erasure coding
+#include <gf_rand.h>
+#include "jerasure.h"
+#include "jerasure/reed_sol.h"
+
 /*
  *
  *
@@ -33,17 +38,11 @@
 #include <openssl/hmac.h>
 #include <math.h>
 
-#include <stdlib.h>
-#include <jerasure.h>
-// #include "erasure_coding.h"
-#include <reed_sol.h>
-
-
 // TODO: How should these be stored?
 uint8_t dh_sharedKey[ECC_PUB_KEY_SIZE];
+uint8_t sgx_pubKey[ECC_PUB_KEY_SIZE];  // SGX node's public key for DH exchange
 PorSK porSK;
 File files[MAX_FILES];
-IP IPs [Max_PEER];
 
 #ifdef TEST_MODE
 
@@ -180,8 +179,6 @@ int EncryptData(uint32_t* KEY,void* buffer, int dataLen)
     }
   return 0;
 }
-
-
 
 // Uses repeated calls to ocall_printf, to print arbitrarily sized bignums
 void printBN(BIGNUM *bn, int size) 
@@ -441,62 +438,14 @@ void code_data(int *symbolData, int blocksInGroup, int type)
 void ecall_generate_file_parity(int fileNum) 
 {
 
-
-	// Find a better place for it
-	IPEntry ip_list[Max_PEER] = {
-        {"192.168.1.1", 22},   
-        {"10.0.0.2", 80},      
-        {"172.16.0.5", 443},   
-        {"8.8.8.8", 53}        
-    };
-	// specify the needed peers
-	for (int i = 0; i < Max_PEER; i++)
-	{
-		IPs[i].ip = ip_list[i][0];
-		IPs[i].port = ip_list[i][1];
-
-	}
-	
-
-
-	// Define encoded_chunks outside of the if block
-    uint8_t **encoded_chunks = (uint8_t **)malloc(files[fileNum].n * sizeof(uint8_t *));
-    if (!encoded_chunks) {
-        ocall_print("Error: Memory allocation for encoded_chunks failed\n");
-        return;
-    }
-
-    // Call erasure coding function
-    int status = encode_with_erasure_coding(fileNum, encoded_chunks);
-    if (status != 0) {
-        ocall_print("Error: Erasure coding failed\n");
-        free(encoded_chunks);
-        return;
-    }
-
-    // Now, encoded_chunks is available for the rest of the function
-    uint8_t *inputFile = encoded_chunks[0]; // Treat the first chunk as input for the next steps
-
-
     // generating parity data, encrypting it and sending it to FTL.
 
-	// Compute the number of blocks in this chunk
-	int numBlocks = files[fileNum].numBlocks / files[fileNum].k;
-
-	// Compute the number of pages in this chunk
-	int numPages = numBlocks * PAGE_PER_BLOCK;
-
-	// Compute the number of groups within this chunk
-	int numGroups = files[fileNum].numGroups / files[fileNum].k;
-
-	// Compute numBits based on numPages
-	int numBits = (int)ceil(log2(numPages));
 
     // Generate groups array.
-    // int numBlocks = files[fileNum].numBlocks;
-    // int numPages = numBlocks * PAGE_PER_BLOCK;
-	// int numGroups = files[fileNum].numGroups;
-    // int numBits = (int)ceil(log2(numPages));
+    int numBlocks = files[fileNum].numBlocks;
+    int numPages = numBlocks * PAGE_PER_BLOCK;
+	int numGroups = files[fileNum].numGroups;
+    int numBits = (int)ceil(log2(numPages));
 
 	ocall_init_parity(numBits); /* 
 							     * This Does two things:
@@ -1709,70 +1658,698 @@ void ecall_audit_file(const char *fileName, int *ret)
 
 
 
-/**
- * Applies (n, k) erasure coding inside an SGX enclave.
- *
- * @param fileNum - Index of the file in the `files` array.
- * @param encoded_chunks - Pointer to an enclave-allocated array storing `n` encoded chunks.
- *
- * @return 0 on success, -1 on failure.
- */
-int encode_with_erasure_coding(int fileNum, uint8_t **encoded_chunks) {
+// Node management functions
+void init_node_network() {
+    // Initialize node 0 (current node)
+    nodes[0].node_id = 0;
+    strcpy(nodes[0].ip_addr, "192.168.1.101");
+    nodes[0].port = 8080;
+    nodes[0].status = NODE_ONLINE;
+    nodes[0].is_authenticated = 0;
+    nodes[0].socket = -1;
+
+    // Initialize node 1
+    nodes[1].node_id = 1;
+    strcpy(nodes[1].ip_addr, "192.168.1.102");
+    nodes[1].port = 8081;
+    nodes[1].status = NODE_OFFLINE;
+    nodes[1].is_authenticated = 0;
+    nodes[1].socket = -1;
+
+    // Initialize node 2
+    nodes[2].node_id = 2;
+    strcpy(nodes[2].ip_addr, "192.168.1.103");
+    nodes[2].port = 8082;
+    nodes[2].status = NODE_OFFLINE;
+    nodes[2].is_authenticated = 0;
+    nodes[2].socket = -1;
+
+    // Initialize node 3
+    nodes[3].node_id = 3;
+    strcpy(nodes[3].ip_addr, "192.168.1.104");
+    nodes[3].port = 8083;
+    nodes[3].status = NODE_OFFLINE;
+    nodes[3].is_authenticated = 0;
+    nodes[3].socket = -1;
+
+    current_node_id = 0;
+    connected_nodes = 1;  // Only current node is connected initially
+}
+
+int connect_to_node(int target_id) {
+	init_node_network();
+    if (target_id < 0 || target_id >= MAX_NODES) {
+        return -1;  // Invalid node ID
+    }
+
+    if (nodes[target_id].status != NODE_ONLINE) {
+        return -2;  // Node is not online
+    }
+
+    // Establish TCP connection using OCall
+    int sockfd;
+    int result = ocall_establish_secure_connection(
+        nodes[target_id].ip_addr,
+        nodes[target_id].port,
+        &sockfd
+    );
+
+    if (result < 0 || sockfd < 0) {
+        return -3;  // Connection failed
+    }
+
+    // Generate random challenge for handshake
+    uint8_t challenge[32];
+    sgx_read_rand(challenge, sizeof(challenge));
+
+    // Send our public key and challenge
+    uint8_t handshake_data[ECC_PUB_KEY_SIZE + 32];
+    memcpy(handshake_data, sgx_pubKey, ECC_PUB_KEY_SIZE);
+    memcpy(handshake_data + ECC_PUB_KEY_SIZE, challenge, 32);
+
+    // Send handshake data
+    if (ocall_send_data(sockfd, handshake_data, sizeof(handshake_data)) != 0) {
+        close(sockfd);
+        return -4;  // Failed to send handshake data
+    }
+
+    // Receive response (target's public key + challenge response)
+    uint8_t response[ECC_PUB_KEY_SIZE + 32];
+    if (ocall_receive_data(sockfd, response, sizeof(response)) != 0) {
+        close(sockfd);
+        return -5;  // Failed to receive response
+    }
+
+    // Store target's public key
+    memcpy(nodes[target_id].public_key, response, ECC_PUB_KEY_SIZE);
+
+    // Verify challenge response
+    uint8_t expected_response[32];
+    hmac_sha1(challenge, sizeof(challenge), dh_sharedKey, ECC_PUB_KEY_SIZE, expected_response, NULL);
+    
+    if (memcmp(expected_response, response + ECC_PUB_KEY_SIZE, 32) != 0) {
+        close(sockfd);
+        return -6;  // Challenge verification failed
+    }
+
+    // Generate shared secret for future communications
+    uint8_t shared_secret[32];
+    hmac_sha1(dh_sharedKey, ECC_PUB_KEY_SIZE, challenge, sizeof(challenge), shared_secret, NULL);
+    memcpy(nodes[target_id].shared_secret, shared_secret, sizeof(shared_secret));
+
+    // Update node status
+    nodes[target_id].status = NODE_BUSY;
+    nodes[target_id].is_authenticated = 1;
+    nodes[target_id].socket = sockfd;
+
+    return 0;  // Connection successful
+}
+
+int disconnect_from_node(int target_id) {
+    if (target_id < 0 || target_id >= MAX_NODES) {
+        return -1;  // Invalid node ID
+    }
+    
+    // Clean up connection to target node
+    nodes[target_id].status = NODE_OFFLINE;
+    connected_nodes--;
+    return 0;
+}
+
+int request_data_from_node(int target_id, uint8_t data_number) {
+    if (target_id < 0 || target_id >= MAX_NODES) {
+        return -1;  // Invalid node ID
+    }
+    
+    // Create and send data request
+    DataRequest request;
+    request.source_node_id = current_node_id;
+    request.target_node_id = target_id;
+    request.data_number = data_number;
+    request.is_valid = 1;  // Changed from true to 1
+    
+    // Send request through untrusted app
+    return ocall_send_data(nodes[target_id].socket, (uint8_t*)&request, sizeof(DataRequest));
+}
+
+int send_data_to_node(int target_id, const uint8_t* data, size_t data_len, uint8_t data_number) {
+    if (target_id < 0 || target_id >= MAX_NODES) {
+        return -1;  // Invalid node ID
+    }
+    
+    // Create data request with the data
+    DataRequest request;
+    request.source_node_id = current_node_id;
+    request.target_node_id = target_id;
+    request.data_number = data_number;
+    request.is_valid = 1;  // Changed from true to 1
+    request.data_len = data_len;
+    memcpy(request.data, data, data_len);
+    
+    // Send data through untrusted app
+    return ocall_send_data(nodes[target_id].socket, (uint8_t*)&request, sizeof(DataRequest));
+}
+
+
+// Thread function to retrieve data from a node
+void* retrieve_data_thread(void* arg) {
+    ThreadData* data = (ThreadData*)arg;
+    
+    // Prepare request
+    data->request = (DataRequest*)malloc(sizeof(DataRequest));
+    data->request->type = REQUEST_BLOCK;
+    data->request->block_num = data->target_block_num;
+    data->request->source_node_id = current_node_id;
+    data->request->target_node_id = data->target_node_id;
+    data->request->is_valid = 1;
+    
+    // Send request
+    if (ocall_send_data(nodes[data->target_node_id].socket, (uint8_t*)data->request, sizeof(DataRequest)) != 0) {
+        pthread_mutex_lock(data->mutex);
+        (*data->responses_received)--;
+        pthread_mutex_unlock(data->mutex);
+        free(data->request);
+        return NULL;
+    }
+    
+    // Receive response
+    DataResponse response;
+    if (ocall_receive_data(nodes[data->target_node_id].socket, (uint8_t*)&response, sizeof(DataResponse)) != 0) {
+        pthread_mutex_lock(data->mutex);
+        (*data->responses_received)--;
+        pthread_mutex_unlock(data->mutex);
+        free(data->request);
+        return NULL;
+    }
+    
+    // Verify response
+    if (response.status != RESPONSE_SUCCESS) {
+        pthread_mutex_lock(data->mutex);
+        (*data->responses_received)--;
+        pthread_mutex_unlock(data->mutex);
+        free(data->request);
+        return NULL;
+    }
+    
+    // Verify data integrity using HMAC
+    uint8_t calculated_hmac[KEY_SIZE];
+    size_t hmac_len = KEY_SIZE;
+    hmac_sha1(nodes[data->target_node_id].shared_secret, KEY_SIZE, response.data, BLOCK_SIZE, calculated_hmac, &hmac_len);
+    
+    if (memcmp(calculated_hmac, response.hmac, KEY_SIZE) != 0) {
+        pthread_mutex_lock(data->mutex);
+        (*data->responses_received)--;
+        pthread_mutex_unlock(data->mutex);
+        free(data->request);
+        return NULL;
+    }
+    
+    // Store block in ordered position based on data_number
+    pthread_mutex_lock(data->mutex);
+    if (response.data_num >= 0 && response.data_num < K) {
+        memcpy(data->ordered_blocks[response.data_num], response.data, BLOCK_SIZE);
+        data->success = 1;
+    }
+    pthread_mutex_unlock(data->mutex);
+    
+    free(data->request);
+    return NULL;
+}
+
+// Function to perform distributed recovery
+int distributed_recovery(const char* file_name, int total_blocks, FileSegments* file_segments, int block_num) {
+    if (!file_name || !file_segments) {
+        return -1;  // Invalid parameters
+    }
+
+    // Get file index and prime value
+    int file_index = -1;
+    for (int i = 0; i < MAX_FILES; i++) {
+        if (strcmp(file_name, files[i].fileName) == 0) {
+            file_index = i;
+            break;
+        }
+    }
+    if (file_index == -1) {
+        return -2;  // File not found
+    }
+
+    // Initialize thread synchronization
+    pthread_mutex_t mutex;
+    pthread_mutex_init(&mutex, NULL);
+    int responses_received = 0;
+    int required_responses = K;  // We need K blocks for recovery
+
+    // Process each block
+    for (int current_block = 0; current_block < total_blocks; current_block++) {
+        // Get expected sigma for this block
+        BIGNUM* expected_sigma = get_sigma(current_block, file_name, files[file_index].prime);
+        if (!expected_sigma) {
+            continue;  // Skip if we can't get sigma
+        }
+
+        // Try to retrieve and verify block locally
+        uint8_t block_data[BLOCK_SIZE];
+        int result = retrieve_and_verify_block(current_block, file_name, expected_sigma, files[file_index].prime);
+        
+        if (result == 0) {
+            // Block is healthy, store it and continue to next block
+            memcpy(file_segments->segments[current_block].data, block_data, BLOCK_SIZE);
+            BN_free(expected_sigma);
+            continue;
+        }
+
+        // Block is corrupted, need to recover it
+        BN_free(expected_sigma);
+
+        // Count online nodes and establish connections
+        int num_online_nodes = 0;
+        for (int i = 0; i < MAX_NODES; i++) {
+            if (i != current_node_id && nodes[i].status == NODE_ONLINE) {
+                if (connect_to_node(i) == 0) {
+                    nodes[i].status = NODE_BUSY;
+                    num_online_nodes++;
+                }
+            }
+        }
+
+        if (num_online_nodes < required_responses) {
+            // Clean up connections
+            for (int i = 0; i < MAX_NODES; i++) {
+                if (i != current_node_id && nodes[i].status == NODE_BUSY) {
+                    if (nodes[i].socket >= 0) {
+                        ocall_close_connection(nodes[i].socket);
+                        nodes[i].socket = -1;
+                    }
+                    nodes[i].status = NODE_ONLINE;
+                    nodes[i].is_authenticated = 0;
+                }
+            }
+            pthread_mutex_destroy(&mutex);
+            return -4;  // Recovery failed - not enough online nodes
+        }
+
+        // Allocate memory for thread data and responses
+        ThreadData* thread_data = (ThreadData*)malloc(num_online_nodes * sizeof(ThreadData));
+        pthread_t* threads = (pthread_t*)malloc(num_online_nodes * sizeof(pthread_t));
+        int thread_count = 0;
+
+        // Request K blocks from other nodes
+        int requests_made = 0;
+        int max_requests = K ;  // We can request up to K+M blocks
+        uint8_t* temp_blocks[K];  // Temporary storage for K blocks
+
+        // Initialize temp_blocks
+        for (int i = 0; i < K; i++) {
+            temp_blocks[i] = (uint8_t*)malloc(BLOCK_SIZE);
+        }
+
+        while (requests_made < max_requests) {
+            // Launch threads for each online node
+            for (int j = 0; j < MAX_NODES; j++) {
+                if (j != current_node_id && nodes[j].status == NODE_BUSY) {
+                    thread_data[thread_count].target_node_id = j;
+                    thread_data[thread_count].target_block_num = current_block;
+                    thread_data[thread_count].success = 0;
+                    thread_data[thread_count].mutex = &mutex;
+                    thread_data[thread_count].responses_received = &responses_received;
+                    thread_data[thread_count].ordered_blocks = temp_blocks;
+
+                    if (pthread_create(&threads[thread_count], NULL, retrieve_data_thread, &thread_data[thread_count]) == 0) {
+                        thread_count++;
+                    }
+                }
+            }
+
+            // Wait for all threads to complete
+            for (int j = 0; j < thread_count; j++) {
+                pthread_join(threads[j], NULL);
+            }
+
+            if (responses_received >= required_responses) {
+                // We have K valid blocks, perform RS recovery
+                uint8_t recovered_block[BLOCK_SIZE];
+                int rs_result = ocall_RS_recovery(temp_blocks, K, N, current_block, recovered_block);
+                if (rs_result == 0) {
+                    // Recovery successful, store the recovered block
+                    memcpy(file_segments->segments[current_block].data, recovered_block, BLOCK_SIZE);
+                    break;
+                }
+            }
+
+            requests_made++;
+        }
+
+        // Clean up temp blocks
+        for (int i = 0; i < K; i++) {
+            free(temp_blocks[i]);
+        }
+
+        // Clean up thread resources
+        free(thread_data);
+        free(threads);
+
+        // Clean up connections
+        for (int i = 0; i < MAX_NODES; i++) {
+            if (i != current_node_id && nodes[i].status == NODE_BUSY) {
+                if (nodes[i].socket >= 0) {
+                    ocall_close_connection(nodes[i].socket);
+                    nodes[i].socket = -1;
+                }
+                nodes[i].status = NODE_ONLINE;
+                nodes[i].is_authenticated = 0;
+            }
+        }
+    }
+
+    pthread_mutex_destroy(&mutex);
+    return 0;  // Success
+}
+
+// Helper function to verify block integrity
+int verify_block_integrity(const uint8_t* block_data, BIGNUM* expected_sigma, const uint8_t* prime) {
+    if (!block_data || !expected_sigma || !prime) {
+        return 1;  // Invalid input parameters
+    }
+
+    // Create arrays needed for audit_block_group
+    int block_nums[1] = {0};  // Single block to verify
+    BIGNUM* sigmas[1] = {expected_sigma};
+    Tag* tag = (Tag*)malloc(sizeof(Tag));
+    if (!tag) {
+        return 1;  // Memory allocation failure
+    }
+
+    // Call audit_block_group with single block
+    int result = audit_block_group(0, 1, block_nums, sigmas, tag, (uint8_t*)block_data);
+
+    // Clean up
+    free(tag);
+
+    return result;  // Returns 0 if integrity verified, non-zero if different
+}
+
+// Function to retrieve and verify a specific block from FTL
+int retrieve_and_verify_block(int block_num, const char* file_name, BIGNUM* expected_sigma, const uint8_t* prime) {
+    if (!file_name || !expected_sigma || !prime) {
+        return 1;  // Invalid parameters
+    }
+
+    // Allocate buffer for block data
+    uint8_t block_data[BLOCK_SIZE];
+    
+    // Read block from FTL
+    ocall_get_block(block_data, SEGMENT_SIZE, SEGMENT_PER_BLOCK, block_num, file_name);
+    
+    // Verify block integrity
+    return verify_block_integrity(block_data, expected_sigma, prime);
+}
+
+// Function to handle incoming data requests and perform handshake
+int ecall_handle_incoming_request(DataRequest* request, int socket_fd) {
+    if (!request) {
+        return -1;  // Invalid request
+    }
+
+    // Handle handshake if not already authenticated
+    int sender_id = request->source_node_id;
+    if (sender_id >= 0 && sender_id < MAX_NODES && !nodes[sender_id].is_authenticated) {
+        // Generate challenge for handshake
+        uint8_t challenge[32];
+        sgx_read_rand(challenge, sizeof(challenge));
+
+        // Send our public key and challenge
+        uint8_t handshake_data[ECC_PUB_KEY_SIZE + 32];
+        memcpy(handshake_data, sgx_pubKey, ECC_PUB_KEY_SIZE);
+        memcpy(handshake_data + ECC_PUB_KEY_SIZE, challenge, 32);
+
+        // Send handshake data
+        if (ocall_send_data(socket_fd, handshake_data, sizeof(handshake_data)) != 0) {
+            return -2;  // Failed to send handshake data
+        }
+
+        // Receive response (sender's public key + challenge response)
+        uint8_t response[ECC_PUB_KEY_SIZE + 32];
+        if (ocall_receive_data(socket_fd, response, sizeof(response)) != 0) {
+            return -3;  // Failed to receive response
+        }
+
+        // Store sender's public key
+        memcpy(nodes[sender_id].public_key, response, ECC_PUB_KEY_SIZE);
+
+        // Verify challenge response
+        uint8_t expected_response[32];
+        hmac_sha1(challenge, sizeof(challenge), dh_sharedKey, ECC_PUB_KEY_SIZE, expected_response, NULL);
+        
+        if (memcmp(expected_response, response + ECC_PUB_KEY_SIZE, 32) != 0) {
+            return -4;  // Challenge verification failed
+        }
+
+        // Generate shared secret for future communications
+        uint8_t shared_secret[32];
+        hmac_sha1(dh_sharedKey, ECC_PUB_KEY_SIZE, challenge, sizeof(challenge), shared_secret, NULL);
+        memcpy(nodes[sender_id].shared_secret, shared_secret, sizeof(shared_secret));
+
+        // Update node status
+        nodes[sender_id].is_authenticated = 1;
+        nodes[sender_id].socket = socket_fd;
+    }
+
+    // Process the actual data request
+    if (request->type == REQUEST_BLOCK) {
+        // Read the requested block from FTL
+        uint8_t block_data[BLOCK_SIZE];
+        ocall_get_block(block_data, SEGMENT_SIZE, SEGMENT_PER_BLOCK, request->block_num, files[0].fileName);
+
+        // Generate HMAC for data integrity
+        uint8_t hmac[KEY_SIZE];
+        size_t hmac_len = KEY_SIZE;
+        hmac_sha1(nodes[sender_id].shared_secret, KEY_SIZE, block_data, BLOCK_SIZE, hmac, &hmac_len);
+
+        // Prepare response
+        DataResponse response;
+        response.status = RESPONSE_SUCCESS;
+        response.data_num = request->data_num;
+        memcpy(response.data, block_data, BLOCK_SIZE);
+        memcpy(response.hmac, hmac, KEY_SIZE);
+
+        // Send response
+        if (ocall_send_data(socket_fd, (uint8_t*)&response, sizeof(DataResponse)) != 0) {
+            return -5;  // Failed to send response
+        }
+    }
+
+    return 0;  // Request processed successfully
+}
+
+// Function to handle incoming connections and requests
+void* handle_connection(void* arg) {
+    int socket_fd = *(int*)arg;
+    free(arg);  // Free the argument as we don't need it anymore
+
+    while (1) {
+        // Receive the data request
+        DataRequest request;
+        if (ocall_receive_data(socket_fd, (uint8_t*)&request, sizeof(DataRequest)) != 0) {
+            break;  // Connection terminated or error
+        }
+
+        // Process request through enclave
+        int result = ecall_handle_incoming_request(&request, socket_fd);
+        if (result != 0) {
+            break;  // Error in processing request
+        }
+    }
+
+    // Clean up connection
+    ocall_close_connection(socket_fd);
+    return NULL;
+}
+
+// Function to start listening for incoming connections
+void start_listening() {
+    int server_socket = ocall_create_server_socket(8080);
+    if (server_socket < 0) {
+        ocall_print_string("Failed to create server socket\n");
+        return;
+    }
+
+    ocall_print_string("Server listening on port 8080\n");
+
+    while (1) {
+        struct sockaddr_in client_addr;
+        int client_socket = ocall_accept_connection(server_socket, &client_addr);
+        if (client_socket < 0) {
+            ocall_print_string("Failed to accept connection\n");
+            continue;
+        }
+
+        // Create thread to handle client connection
+        pthread_t thread;
+        int* client_sock = malloc(sizeof(int));
+        *client_sock = client_socket;
+        if (pthread_create(&thread, NULL, handle_connection, client_sock) != 0) {
+            ocall_print_string("Failed to create thread\n");
+            free(client_sock);
+            ocall_close_socket(client_socket);
+            continue;
+        }
+        pthread_detach(thread);
+    }
+
+    ocall_close_socket(server_socket);
+}
+
+// Function to prepare data for audit_block_group
+int prepare_audit_data(int fileNum) {
     if (fileNum < 0 || fileNum >= MAX_FILES || !files[fileNum].inUse) {
-        ocall_print("Error: Invalid file index\n");
-        return -1;
+        return -1;  // Invalid file number
     }
 
-    // Retrieve file metadata
-    int k = files[fileNum].k;       // Data chunks
-    int n = files[fileNum].n;       // Total chunks (data + parity)
-    int numBlocks = files[fileNum].numBlocks;  // Total number of blocks
+    // Process each group
+    for (int group = 0; group < files[fileNum].numGroups; group++) {
+        // Calculate number of blocks in this group
+        int blocksInGroup = (group == files[fileNum].numGroups - 1) ? 
+                           files[fileNum].numBlocks - (group * BLOCKS_PER_GROUP) : 
+                           BLOCKS_PER_GROUP;
 
-    // Calculate correct chunk size
-    int chunk_size = (numBlocks * BLOCK_SIZE) / k;  // Divide actual data into k chunks
+        // Allocate memory for this group's data
+        uint8_t** blocks = (uint8_t**)malloc(blocksInGroup * sizeof(uint8_t*));
+        BIGNUM** sigmas = (BIGNUM**)malloc(blocksInGroup * sizeof(BIGNUM*));
+        uint8_t** group_data = (uint8_t**)malloc(blocksInGroup * sizeof(uint8_t*));
+        Tag* tag = (Tag*)malloc(sizeof(Tag));
 
-    uint8_t *data_chunks[k];
-    uint8_t *parity_chunks[n - k];
-
-    // Allocate enclave memory for data and parity chunks
-    for (int i = 0; i < k; i++) {
-        data_chunks[i] = (uint8_t *)malloc(chunk_size);
-        if (!data_chunks[i]) {
-            ocall_print("Error: Memory allocation failed for data_chunks\n");
-            return -1;
+        if (!blocks || !sigmas || !group_data || !tag) {
+            // Cleanup on failure
+            if (blocks) {
+                for (int i = 0; i < blocksInGroup; i++) {
+                    if (blocks[i]) free(blocks[i]);
+                }
+                free(blocks);
+            }
+            if (sigmas) {
+                for (int i = 0; i < blocksInGroup; i++) {
+                    if (sigmas[i]) BN_free(sigmas[i]);
+                }
+                free(sigmas);
+            }
+            if (group_data) {
+                for (int i = 0; i < blocksInGroup; i++) {
+                    if (group_data[i]) free(group_data[i]);
+                }
+                free(group_data);
+            }
+            if (tag) free(tag);
+            return -2;  // Memory allocation failed
         }
-    }
 
-    for (int i = 0; i < (n - k); i++) {
-        parity_chunks[i] = (uint8_t *)malloc(chunk_size);
-        if (!parity_chunks[i]) {
-            ocall_print("Error: Memory allocation failed for parity_chunks\n");
-            return -1;
+        // Initialize arrays for this group
+        for (int i = 0; i < blocksInGroup; i++) {
+            blocks[i] = (uint8_t*)malloc(BLOCK_SIZE);
+            group_data[i] = (uint8_t*)malloc(BLOCK_SIZE);
+            sigmas[i] = BN_new();
+            BN_zero(sigmas[i]);
+
+            if (!blocks[i] || !group_data[i] || !sigmas[i]) {
+                // Cleanup on failure
+                for (int j = 0; j < i; j++) {
+                    free(blocks[j]);
+                    free(group_data[j]);
+                    BN_free(sigmas[j]);
+                }
+                free(blocks);
+                free(sigmas);
+                free(group_data);
+                free(tag);
+                return -3;  // Memory allocation failed
+            }
         }
-        memset(parity_chunks[i], 0, chunk_size);  // Initialize parity data
+
+        // Initialize tag information
+        tag->prfKey = files[fileNum].sortKey;
+        tag->prime = files[fileNum].prime;
+        tag->alpha = files[fileNum].alpha;
+        tag->beta = files[fileNum].beta;
+
+        // Read blocks from FTL
+        for (int i = 0; i < blocksInGroup; i++) {
+            int blockNum = (group * BLOCKS_PER_GROUP) + i;
+            int segNum = floor(blockNum / SEGMENT_PER_BLOCK);
+            int segOffset = (blockNum % SEGMENT_PER_BLOCK) * BLOCK_SIZE;
+            
+            uint8_t segData[SEGMENT_SIZE];
+            if (ocall_get_segment(files[fileNum].fileName, segNum, segData, 0) != 0) {
+                // Cleanup on failure
+                for (int j = 0; j < blocksInGroup; j++) {
+                    free(blocks[j]);
+                    free(group_data[j]);
+                    BN_free(sigmas[j]);
+                }
+                free(blocks);
+                free(sigmas);
+                free(group_data);
+                free(tag);
+                return -4;  // Failed to read segment
+            }
+            
+            memcpy(blocks[i], segData + segOffset, BLOCK_SIZE);
+        }
+
+        // Get sigma values for each block
+        const int totalSegments = (files[fileNum].numBlocks * SEGMENT_PER_BLOCK);
+        int sigPerSeg = floor((double)SEGMENT_SIZE / ((double)PRIME_LENGTH / 8));
+        int startSeg = totalSegments;
+
+        for (int i = 0; i < blocksInGroup; i++) {
+            int blockNum = (group * BLOCKS_PER_GROUP) + i;
+            int sigSegNum = floor(blockNum / sigPerSeg) + startSeg;
+            
+            uint8_t sigData[SEGMENT_SIZE];
+            if (ocall_get_segment(files[fileNum].fileName, sigSegNum, sigData, 0) != 0) {
+                // Cleanup on failure
+                for (int j = 0; j < blocksInGroup; j++) {
+                    free(blocks[j]);
+                    free(group_data[j]);
+                    BN_free(sigmas[j]);
+                }
+                free(blocks);
+                free(sigmas);
+                free(group_data);
+                free(tag);
+                return -5;  // Failed to read sigma segment
+            }
+            
+            int segIndex = blockNum % sigPerSeg;
+            BN_bin2bn(sigData + (segIndex * (PRIME_LENGTH / 8)), PRIME_LENGTH / 8, sigmas[i]);
+        }
+
+        // Perform audit for this group
+        int result = audit_block_group(fileNum, blocksInGroup, NULL, sigmas, tag, (uint8_t*)blocks);
+        if (result != 0) {
+            // Cleanup on failure
+            for (int i = 0; i < blocksInGroup; i++) {
+                free(blocks[i]);
+                free(group_data[i]);
+                BN_free(sigmas[i]);
+            }
+            free(blocks);
+            free(sigmas);
+            free(group_data);
+            free(tag);
+            return -6;  // Audit failed
+        }
+
+        // Clean up after successful audit
+        for (int i = 0; i < blocksInGroup; i++) {
+            free(blocks[i]);
+            free(group_data[i]);
+            BN_free(sigmas[i]);
+        }
+        free(blocks);
+        free(sigmas);
+        free(group_data);
+        free(tag);
     }
 
-    // Generate Reed-Solomon coding matrix
-    int *matrix = reed_sol_vandermonde_coding_matrix(k, n, 8);
-    if (!matrix) {
-        ocall_print("Error: Failed to generate coding matrix\n");
-        return -1;
-    }
-
-    // Encode data using Jerasure
-    jerasure_matrix_encode(k, n, 8, matrix, (char **)data_chunks, (char **)parity_chunks, chunk_size);
-
-    // Store encoded chunks inside the enclave memory
-    for (int i = 0; i < k; i++) {
-        encoded_chunks[i] = data_chunks[i];
-    }
-    for (int i = 0; i < (n - k); i++) {
-        encoded_chunks[k + i] = parity_chunks[i];
-    }
-
-    // Free matrix memory
-    free(matrix);
-
-    ocall_print("Erasure coding completed successfully!\n");
-    return 0; // Success
+    return result;  // Success
 }

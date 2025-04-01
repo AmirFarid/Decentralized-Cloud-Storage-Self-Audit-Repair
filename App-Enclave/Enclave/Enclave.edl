@@ -1,5 +1,3 @@
-
-
 enclave {
 
 	include "sharedTypes.h"
@@ -13,11 +11,10 @@ enclave {
 		public void ecall_audit_file([in, string] const char *fileName,[out] int *ret);
 		public void ecall_generate_file_parity(int fileNum);
 		public void ecall_decode_partition([in, string] const char *fileName, int blockNum);
+		public int ecall_handle_incoming_request([in] DataRequest* request, int socket_fd);
 	};
 
 	untrusted {
-
-
 
 		void ocall_ftl_init([in, count=64] uint8_t *sgx_pubKey, [out,count=64] uint8_t *ftl_pubKey);
 
@@ -41,6 +38,18 @@ enclave {
 
 		void ocall_write_page(int pageNum, [in, size=2048] uint8_t *pageData);
 
+		// Network communication
+		int ocall_send_data([in, count=len] const uint8_t* data, size_t len);
+		int ocall_receive_data([out, count=len] uint8_t* data, size_t len);
+		int ocall_establish_secure_connection([in, string] const char* ip_addr, uint16_t port);
+		void ocall_close_connection(int sockfd);
+
+		// Reed-Solomon recovery
+		int ocall_RS_recovery([in, count=K] uint8_t** blocks, int k, int n, int block_num);
+
+		// Additional network-related OCALLs
+		int ocall_init_server_socket();
+		int ocall_accept_connection(int server_socket);
 	};
 };
 
