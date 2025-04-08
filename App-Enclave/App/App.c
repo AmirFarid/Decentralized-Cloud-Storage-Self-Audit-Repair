@@ -18,6 +18,18 @@
 #include "ccom.h"
 #include <time.h>
 
+// TODOA: Check these headers
+#include <stdio.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+
+#include "../p2p_network/include/p2p_network.h"
+
+
 #include <string.h>
 
 void ocall_send_parity(int startPage, uint8_t *parityData, size_t size)
@@ -259,11 +271,11 @@ void app_file_init(sgx_enclave_id_t eid, const char *fileName,  int numBlocks)
 
 	//printf("call ecall\n");
 	int fileNum = 0;
-    status = ecall_file_init(eid, &fileNum, fileName, tag, *sigma, numBlocks); // make sure the change to returning fileNum works properly.
-    if (status != SGX_SUCCESS) {
-        printf("Error calling enclave function: %d\n", status);
-        return;
-    }
+    // status = ecall_file_init(eid, &fileNum, fileName, tag, *sigma, numBlocks); // make sure the change to returning fileNum works properly.
+    // if (status != SGX_SUCCESS) {
+    //     printf("Error calling enclave function: %d\n", status);
+    //     return;
+    // }
 
 
     /* Open the file for reading */
@@ -360,6 +372,270 @@ void app_file_init(sgx_enclave_id_t eid, const char *fileName,  int numBlocks)
 
 
 
+// SGX to SGX connection functions 
+
+void* connection_thread_func(void *args_ptr) {
+    ThreadArgs *args = (ThreadArgs *)args_ptr;
+    uint8_t nodeID = args->nodeID;
+
+    if (nodeID >= NUM_NODES) {
+        printf("Invalid nodeID: %d\n", nodeID);
+        free(args);
+        return NULL;
+    }
+
+    NodeInfo *node = &nodes[nodeID];
+
+    // 1. Create and connect the socket
+    node->socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (node->socket_fd < 0) {
+        printf("Socket creation failed for node %d\n", nodeID);
+        free(args);
+        return NULL;
+    }
+
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(node->port);
+
+    if (inet_pton(AF_INET, node->ip, &server_addr.sin_addr) <= 0) {
+        printf("Invalid IP for node %d\n", nodeID);
+        close(node->socket_fd);
+        free(args);
+        return NULL;
+    }
+
+    if (connect(node->socket_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        printf("Connection failed for node %d\n", nodeID);
+        close(node->socket_fd);
+        free(args);
+        return NULL;
+    }
+
+    // 2. Exchange public keys
+    if (send(node->socket_fd, args->sgx_host_pubKey, KEY_SIZE, 0) != KEY_SIZE) {
+        printf("Failed to send host pubKey to node %d\n", nodeID);
+        close(node->socket_fd);
+        free(args);
+        return NULL;
+    }
+
+    ssize_t received = recv(node->socket_fd, args->sgx_guest_pubKey, KEY_SIZE, 0);
+    if (received != KEY_SIZE) {
+        printf("Failed to receive guest pubKey from node %d\n", nodeID);
+        close(node->socket_fd);
+        free(args);
+        return NULL;
+    }
+
+
+    // 4. Mark node as ready
+    node->is_ready = 1;
+    printf("Node %d connected and session key initialized.\n", nodeID);
+
+    // Do not close the socket — keep it open for future use!
+    free(args);
+    return NULL;
+}
+
+// 
+void ocall_sgx2sgx_connection(uint8_t *sgx_host_pubKey, uint8_t *sgx_guest_pubKey, uint8_t nodeID) {
+    ThreadArgs *args = malloc(sizeof(ThreadArgs));
+    if (!args) {
+        printf("Failed to allocate memory for thread args\n");
+        return;
+    }
+
+    args->sgx_host_pubKey = sgx_host_pubKey;
+    args->sgx_guest_pubKey = sgx_guest_pubKey;
+    args->nodeID = nodeID;
+
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, connection_thread_func, args) != 0) {
+        printf("Failed to create thread for node %d\n", nodeID);
+        free(args);
+        return;
+    }
+
+    pthread_detach(thread);  // Let the thread run independently
+}
+
+void handle_client(sgx_enclave_id_t eid, int client_socket) {
+
+    // Server side
+    
+    uint8_t *sgx_host_pubKey[KEY_SIZE];
+    uint8_t *sgx_guest_pubKey[KEY_SIZE];
+    uint8_t *nonce[KEY_SIZE];
+
+    ssize_t ns = recv(client_socket, nonce, KEY_SIZE, 0);
+
+
+    // Get the host pubKey and generate private key save in sgx2sgx_privKey
+    ecall_get_pubKey(eid, sgx_host_pubKey);
+
+    // Do key exchange first...
+    ssize_t received = recv(client_socket, sgx_guest_pubKey, KEY_SIZE, 0);
+    if (received != KEY_SIZE) {
+        printf("Failed to receive host pubKey from client\n");
+    
+
+    send(client_socket, sgx_host_pubKey, KEY_SIZE, 0);
+
+    while (1) {
+        uint8_t buffer[1024];
+        ssize_t len = recv(client_socket, buffer, sizeof(buffer), 0);
+        if (len <= 0) break; // client disconnected
+
+        if (strncmp((char*)buffer, "BLOCK:", 6) == 0) {
+            // process block request
+        } else if (strncmp((char*)buffer, "BLOCK:", 6) == 0) {
+
+        } else {
+            // unknown command
+        }
+    }
+
+    close(client_socket);
+}
+}
+
+int setup_server_socket() {
+    int port = 8080;
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket failed");
+        return -1;
+    }
+
+    // Allow port reuse
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt failed");
+        close(server_fd);
+        return -1;
+    }
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = INADDR_ANY
+    };
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind failed");
+        close(server_fd);
+        return -1;
+    }
+
+    if (listen(server_fd, 10) < 0) {
+        perror("listen failed");
+        close(server_fd);
+        return -1;
+    }
+
+    printf("Server is listening on port %d\n", port);
+    return server_fd;
+}
+
+void* listener_thread_func(sgx_enclave_id_t eid) {
+    int server_socket = setup_server_socket();
+    if (server_socket < 0) {
+        printf("Failed to setup server socket\n");
+        return NULL;
+    }
+
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &addr_len);
+
+        if (client_socket < 0) {
+            perror("Accept failed");
+            continue;
+        }
+
+        handle_client(eid, client_socket);  // or create another thread for each client
+    }
+
+    return NULL;
+}
+
+
+
+void* transfer_chunk_thread_func(void *args_ptr) {
+    TransferThreadArgs *args = (TransferThreadArgs *)args_ptr;
+    uint8_t nodeID = args->nodeID;
+    uint32_t blockID = args->blockID;
+    uint8_t *output_buffer = args->output_buffer;
+    size_t *output_len_ptr = args->output_len_ptr;
+    size_t buf_len = args->buf_len;
+    free(args);  // We can free this, enclave buffer remains
+
+    if (nodeID >= NUM_NODES || !nodes[nodeID].is_ready) {
+        printf("Node %d is not ready\n", nodeID);
+        *output_len_ptr = 0;
+        return NULL;
+    }
+
+    int sock = nodes[nodeID].socket_fd;
+
+    // Send request
+    char msg[64];
+    snprintf(msg, sizeof(msg), "BLOCK:%u", blockID);
+    send(sock, msg, strlen(msg), 0);
+
+    // Receive encrypted data
+    uint8_t encrypted_data[BLOCK_SIZE];
+    ssize_t received = recv(sock, encrypted_data, sizeof(encrypted_data), 0);
+    if (received <= 0 || received > buf_len) {
+        printf("Receive failed or buffer too small\n");
+        *output_len_ptr = 0;
+        return NULL;
+    }
+
+    // Copy received encrypted data into enclave buffer
+    memcpy(output_buffer, encrypted_data, received);
+    *output_len_ptr = received;
+
+    return NULL;
+}
+
+
+
+void ocall_request_data_chunk(uint8_t nodeID, uint32_t blockID, uint8_t *output_buffer, size_t *actual_len, size_t buf_len) {
+    if (nodeID >= NUM_NODES || !nodes[nodeID].is_ready) {
+        printf("Node %d is not ready\n", nodeID);
+        *actual_len = 0;
+        return;
+    }
+
+    TransferThreadArgs *args = malloc(sizeof(TransferThreadArgs));
+    if (!args) {
+        printf("Memory allocation failed\n");
+        *actual_len = 0;
+        return;
+    }
+
+    args->nodeID = nodeID;
+    args->blockID = blockID;
+    args->output_buffer = output_buffer;
+    args->output_len_ptr = actual_len;
+    args->buf_len = buf_len;
+
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, transfer_chunk_thread_func, args) != 0) {
+        printf("Failed to create thread\n");
+        free(args);
+        *actual_len = 0;
+        return;
+    }
+
+    pthread_join(thread, NULL);  // Block until it's done (you can detach instead)
+}
+
+
+
 
 int main(void) 
 {
@@ -428,6 +704,29 @@ int main(void)
     if(status == 0) {
         printf("SUCCESS!!!\n");
     }
+
+    // Add Distribute and repair function logic here.
+    // Erasure code logic here.
+
+    // listener thread.
+    // Server side
+
+    pthread_t listener_thread;
+    sgx_enclave_id_t *eid_ptr = malloc(sizeof(sgx_enclave_id_t));
+    *eid_ptr = eid;
+    if (pthread_create(&listener_thread, NULL, listener_thread_func, eid_ptr) != 0) {
+        perror("Failed to create listener thread");
+        free(eid_ptr);
+        return 1;
+    }
+    pthread_detach(listener_thread);
+
+
+
+
+    // Wait for the listener thread to finish
+    pthread_join(listener_thread, NULL);
+
 
     // Destroy the enclave
     ret = sgx_destroy_enclave(eid);

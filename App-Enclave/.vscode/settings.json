@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "enclave_u.h": "c",
+        "time.h": "c",
+        "ccom.h": "c",
+        "sharedtypes.h": "c",
+        "p2p_network.h": "c"
+    },
+    "makefile.configureOnOpen": false
+}

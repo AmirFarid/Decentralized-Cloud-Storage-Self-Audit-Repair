@@ -38,6 +38,11 @@ uint8_t dh_sharedKey[ECC_PUB_KEY_SIZE];
 PorSK porSK;
 File files[MAX_FILES];
 
+
+uint8_t s2s_server_sharedKey[ECC_PUB_KEY_SIZE];
+uint8_t s2s_server_privKey[ECC_PRV_KEY_SIZE];
+uint8_t s2s_server_pubKey[ECC_PUB_KEY_SIZE];
+
 #ifdef TEST_MODE
 
 static BIGNUM *testFile[SEGMENT_PER_BLOCK * 10];
@@ -1647,4 +1652,218 @@ void ecall_audit_file(const char *fileName, int *ret)
 
 	// Compare the two calculations
 	*ret = BN_cmp(sigma, sigma2);
+}
+
+
+// server side
+
+void ecall_get_pubKey(uint8_t *pubkey) {
+    // memcpy(pubkey, sgx_host_pubKey, KEY_SIZE);
+	// if sgx2sgx_privKey and sgx2sgx_pubKey are not initialized, generate them.
+
+
+
+    prng_init((0xbad ^ 0xc0ffee ^ 42) | 0xcafebabe | 776);
+	for(int i = 0; i < ECC_PRV_KEY_SIZE; ++i) {
+		s2s_server_privKey[i] = prng_next();
+	}
+
+	// uint8_t keyNonce[KEY_SIZE];
+	// sgx_read_rand(keyNonce, KEY_SIZE);
+	// Send nonce to other party
+	// ocall_send_nonce(keyNonce);
+
+
+	// Generate keys
+	ecdh_generate_keys(pubkey, s2s_server_privKey);
+
+	*s2s_server_pubKey = pubkey;
+
+
+
+
+
+
+
+    // TODO: Generate pubkey and private key. save private key in sgx2sgx_privKey and save pubkey in sgx2sgx_pubKey
+
+
+}
+
+// Generate shared key using ECDH
+// server side
+void ecall_gen_s2s_sharedKey(uint8_t *pubkeyclient) {
+	// Generate shared key using ECDH
+	ecdh_shared_secret(s2s_server_privKey, pubkeyclient, s2s_server_sharedKey);
+}
+
+void get_verified_block(int blockID, uint8_t *block) {
+
+	int fileNum = 0;
+
+    // Generate groups array.
+    int numBlocks = files[fileNum].numBlocks;
+    int numPages = numBlocks * PAGE_PER_BLOCK;
+	int numGroups = files[fileNum].numGroups;
+    int numBits = (int)ceil(log2(numPages));
+
+
+    uint64_t **groups = get_groups(files[fileNum].sortKey, numBlocks, numGroups);
+
+    int blockNum = 0;
+    int pageNum = 0;
+    int permutedPageNum = 0;
+    int segNum = 0;
+    int maxBlocksPerGroup = ceil(numBlocks / numGroups);
+    int blocksInGroup = 0;
+
+	uint8_t segData[SEGMENT_SIZE];
+    uint8_t groupData[maxBlocksPerGroup * SEGMENT_PER_BLOCK * SEGMENT_SIZE];
+
+	int startPage = 0; // TODO: This should start at start of parity for file in FTL. This can be calculated based on defined values and data in files struct.
+    
+	for (int group = 0; group < numGroups; group++) {
+
+
+		// Generate shared key used when generating file parity, for permutation and encryption.
+    	uint8_t keyNonce[KEY_SIZE];
+    	uint8_t sharedKey[KEY_SIZE] = {0};
+
+		sgx_read_rand(keyNonce, KEY_SIZE);
+
+		//ocall_printf("Key Nonce:", 12, 0);
+		//ocall_printf(keyNonce, KEY_SIZE, 1);
+
+    	ocall_send_nonce(keyNonce);
+
+    	size_t len = KEY_SIZE;
+    	hmac_sha1(dh_sharedKey, ECC_PUB_KEY_SIZE, keyNonce, KEY_SIZE, sharedKey, &len);
+
+
+        blocksInGroup = 0;
+
+        // Initialize groupData to zeros
+        for (int segment = 0; segment < maxBlocksPerGroup * SEGMENT_PER_BLOCK; segment++) {
+            memset(groupData + (segment * SEGMENT_SIZE), 0, SEGMENT_SIZE); 
+        }
+
+        for (int groupBlock = 0; groupBlock < maxBlocksPerGroup; groupBlock++) { 
+            blockNum = groups[group][groupBlock];
+
+            if (groups[group][groupBlock] == -1) { // This group is not full (it has less than maxBlocksPerGroup blocks). 
+                continue;
+            }
+            blocksInGroup++;
+
+            for (int blockPage = 0; blockPage < PAGE_PER_BLOCK; blockPage++) {
+                pageNum = (blockNum * PAGE_PER_BLOCK) + blockPage;
+
+                permutedPageNum = feistel_network_prp(sharedKey, pageNum, numBits);
+
+
+
+                for (int pageSeg = 0; pageSeg < SEGMENT_PER_BLOCK / PAGE_PER_BLOCK; pageSeg++) {
+                    segNum = (permutedPageNum * SEGMENT_PER_PAGE) + pageSeg;
+                    ocall_get_segment(files[fileNum].fileName, segNum, segData, 0);
+					//JD_TEST
+					//ocall_printf("--------------------------------------------\n\n\n", 50, 0);
+					//ocall_printf("(permuted) segment number:", 27,0);
+					//ocall_printf((uint8_t *) &segNum, sizeof(uint8_t), 2);
+
+					//END JD_TEST
+
+                    DecryptData((uint32_t *)sharedKey, segData, SEGMENT_SIZE); 					
+
+
+                    // Copy segData into groupData
+					int blockOffset = groupBlock * SEGMENT_PER_BLOCK * SEGMENT_SIZE;
+					int pageOffset = blockPage * (SEGMENT_PER_BLOCK / PAGE_PER_BLOCK) * SEGMENT_SIZE;
+					int segOffset = pageSeg * SEGMENT_SIZE;
+                    memcpy(groupData + blockOffset + pageOffset + segOffset, segData, SEGMENT_SIZE);
+                }
+            }
+        }
+
+        // groupData now has group data.
+
+		// Audit group data
+		
+		// Get sigmas and file tag.
+		const int totalSegments = (files[fileNum].numBlocks * SEGMENT_PER_BLOCK);
+	    int sigPerSeg = floor((double)SEGMENT_SIZE / ((double)PRIME_LENGTH / 8));
+	    int tagSegNum = totalSegments + ceil((double)files[fileNum].numBlocks /(double) sigPerSeg);
+		int tagPageNum = floor(tagSegNum / SEGMENT_PER_PAGE);
+		// Permute tagPageNum
+		permutedPageNum = feistel_network_prp(sharedKey, tagPageNum, numBits);
+		tagSegNum = (permutedPageNum * SEGMENT_PER_PAGE) + (tagSegNum % tagPageNum); // note, the tag is after the file, 
+																					// so numBits may be wrong
+
+		ocall_get_segment(files[fileNum].fileName, tagSegNum, segData, 0);
+
+
+		DecryptData((uint32_t *)sharedKey, segData, SEGMENT_SIZE); 
+
+
+
+
+		// Note, I will know that tag and sigmas come from FTL, as they are fully encrypted.
+		Tag *tag = (Tag *)malloc(sizeof(Tag));
+	    memcpy(tag, segData, sizeof(Tag));
+	    decrypt_tag(tag, porSK);
+
+		// Get sigmas
+		BIGNUM *sigmas[blocksInGroup];
+
+
+		for(int i = 0; i < blocksInGroup; i++) {
+ 		   sigmas[i] = BN_new();
+		    BN_zero(sigmas[i]);
+
+		    int startSeg = totalSegments;
+		    int sigSegNum = floor(groups[group][i] / sigPerSeg) + startSeg;
+		    int sigPageNum = floor(sigSegNum / SEGMENT_PER_PAGE);
+
+		    // Permute sigPageNum
+		    permutedPageNum = feistel_network_prp(sharedKey, sigPageNum, numBits);
+		    int permutedSigSegNum = (permutedPageNum * SEGMENT_PER_PAGE) + (sigSegNum % SEGMENT_PER_PAGE);
+
+
+
+		    uint8_t sigData[SEGMENT_SIZE];
+		    ocall_get_segment(files[fileNum].fileName, permutedSigSegNum, sigData, 0);
+
+
+		    DecryptData((uint32_t *)sharedKey, sigData, SEGMENT_SIZE);
+		    int segIndex = groups[group][i] % sigPerSeg;
+		    BN_bin2bn(sigData + (segIndex * (PRIME_LENGTH / 8)), PRIME_LENGTH / 8, sigmas[i]);
+		}
+
+
+		if (audit_block_group(fileNum, blocksInGroup, groups[group], sigmas, tag, groupData) != 0) {
+		    ocall_printf("AUDIT FAILED!!", 15, 0);
+		} else {
+		    ocall_printf("AUDIT SUCCESS!", 15, 0);
+		}
+
+	}
+	// TODO: Implement
+}
+
+// server side
+void ecall_get_block(uint8_t *block, uint8_t *nonce, int blockID) {
+
+	uint8_t sharedKey[KEY_SIZE] = {0};
+
+
+	get_verified_block(blockID, block);
+
+
+	// Generate shared key using HMAC
+	size_t len = KEY_SIZE;
+	hmac_sha1(s2s_server_sharedKey, ECC_PUB_KEY_SIZE, nonce, KEY_SIZE, sharedKey, &len);
+
+	// Encrypt block
+	EncryptData((uint32_t *)sharedKey, block, BLOCK_SIZE);
+
+
 }
